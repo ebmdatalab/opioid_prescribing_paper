@@ -8,9 +8,9 @@
 #       format_version: '1.4'
 #       jupytext_version: 1.1.1
 #   kernelspec:
-#     display_name: Python 3
+#     display_name: Python (opioid_paper)
 #     language: python
-#     name: python3
+#     name: opioid_paper
 # ---
 
 # # Long Term Trends
@@ -20,9 +20,11 @@
 # +
 import pandas as pd
 import numpy as np
-GBQ_PROJECT_ID = '620265099307'
+from ebmdatalab import bq
 
-q4 = '''-- opioid long term data extraction 
+GBQ_PROJECT_ID = "620265099307"
+
+q4 = """-- opioid long term data extraction 
 SELECT 
   year,
   l.chem_substance,
@@ -39,10 +41,9 @@ GROUP BY
   year,
   chem_substance,
   Is_LA, 
-  Is_High_LA'''
+  Is_High_LA"""
 
-
-dfl = pd.io.gbq.read_gbq(q4, GBQ_PROJECT_ID, dialect='standard',verbose=True).fillna(0)
+dfl = bq.cached_read(q4, csv_path="chemical_summary.zip").fillna(0)
 dfl.head()
 # -
 
@@ -441,8 +442,7 @@ GROUP BY
    GROUP BY chem_substance,  formulation
    ORDER BY chem_substance'''
 
-
-tbl = pd.io.gbq.read_gbq(q, GBQ_PROJECT_ID, dialect='standard',verbose=False)
+tbl = bq.cached_read(q, csv_path='by_formulation.zip')
 tbl.head()
 # -
 
@@ -457,19 +457,19 @@ tab
 
 #GBQ_PROJECT_ID = '620265099307'
 
-'''practice-level opioid prescribing data extracted as follows:
+
+# returns 1.2m rows - saved as 235MB of zipped csvs, loaded in next cell
+q = '''
+-- opioids - including practices open/prescribing but not prescribing opioids
+WITH opioid_prescribing AS (
 select p.*
 FROM ebmdatalab.hscic.normalised_prescribing_standard p
 INNER JOIN (SELECT DISTINCT bnf_code FROM `richard.opioid_converter`) o
-ON p.bnf_code = o.bnf_code'''
-# table saved as helen.opioid_prescribing_2010_2018
-
-#q3 = 
-'''
--- opioids - including practices open/prescribing but not prescribing opioids
+ON p.bnf_code = o.bnf_code
+),
 
 -- create a table of all prescribing by practice by month.
-WITH  A AS (
+A AS (
   SELECT practice, pct,
     CAST(month AS DATE) AS year_mon,
     sum(items) AS items
@@ -505,9 +505,8 @@ SELECT
   sum(net_cost) as net_cost,
   sum(actual_cost) as actual_cost
 FROM q2 
-LEFT JOIN ebmdatalab.helen.opioid_prescribing_2010_2018 p ON p.practice = q2.practice AND CAST(p.month AS DATE) = q2.year_mon  
+LEFT JOIN opioid_prescribing p ON p.practice = q2.practice AND CAST(p.month AS DATE) = q2.year_mon  
 LEFT JOIN (SELECT distinct bnf_code, chem_substance, Is_High_LA, Is_LA, dose_per_unit, new_ome_multiplier FROM ebmdatalab.richard.opioid_converter) l on l.bnf_code = p.bnf_code
-
 GROUP BY 
   pct,
   practice,
@@ -518,9 +517,66 @@ GROUP BY
   Is_High_LA
 '''
 
-#df1 = pd.io.gbq.read_gbq(q3, GBQ_PROJECT_ID, dialect='standard',verbose=True)
 
 
+# +
+import glob
+import pandas as pd
+import numpy as np
+
+schema = {
+    "pct": "category",
+    "practice": "category",
+    "status_code": "category",
+    "chem_substance": "category",
+    "Is_LA": "category",
+    "Is_High_LA": "category",
+    "items": pd.Int16Dtype(),
+    "quantity": pd.Int64Dtype(),
+    "total_ome": np.float16,
+    "net_cost": np.float16,
+    "actual_cost": np.float16,
+}
+
+
+def as_true_false(val):
+    "Convert to true/false strings"
+    if isinstance(val, str):
+        if not val:
+            val = None
+        elif str(val).lower() == "true":
+            val = True
+        else:
+            val = False
+    else:
+        if np.isnan(val):
+            val = None
+        else:
+            if val:
+                val = True
+            else:
+                val = False
+    return val
+
+
+converters = {"Is_LA": as_true_false, "Is_High_LA": as_true_false}
+df1 = None
+for path in sorted(glob.glob("opioid*gz")):
+    print("loading {}....".format(path))
+    if df1 is None:
+        df1 = pd.read_csv(path, dtype=schema, parse_dates=["month"], date_parser=lambda col: pd.to_datetime(col, utc=True), converters=converters, low_memory=False)
+    else:
+        df1 = pd.concat([df1, pd.read_csv(path, dtype=schema, parse_dates=["month"], date_parser=lambda col: pd.to_datetime(col, utc=True), converters=converters, low_memory=False)], ignore_index=True)
+
+#for col in ['pct', 'practice', 'status_code', 'chem_substance', 'Is_LA', 'Is_High_LA']:
+#    # Because of the concat above, some of these are converted to objects where new categories are introduced
+#    # between loop iterations
+#    df1[col] = df1[col].astype("category")
+for col in ['Is_LA', 'Is_High_LA']:
+    # Because of the concat above, some of these are converted to objects where new categories are introduced
+    # between loop iterations
+    df1[col] = df1[col].astype("category")
+# + {}
 # import practice list size data
 
 GBQ_PROJECT_ID = '620265099307'
@@ -532,9 +588,12 @@ q2 = '''SELECT practice,
 from ebmdatalab.hscic.practice_statistics_all_years 
 '''
 
-pop = pd.io.gbq.read_gbq(q2, GBQ_PROJECT_ID, dialect='standard',verbose=False)
+pop = bq.cached_read(q2, csv_path='practice_list_size.zip', use_bqstorage_api=True)
+pop['month'] = pd.to_datetime(pop['month'])
 pop.head()
 # -
+
+df1.head()
 
 # ### Load, organise and filter practice-level data
 
@@ -542,28 +601,21 @@ pop.head()
 import pandas as pd
 import numpy as np
 
-# load practice data as CSV (file size does not allow direct load from BigQuery)
-# files were too large to export as a single file from BigQuery so have been split into two:
-df1a = pd.read_csv('opioids_practice_level_extract1.csv')
-df1b = pd.read_csv('opioids_practice_level_extract2.csv')
-
-df1 = pd.concat([df1b,df1a])
 
 # convert dates to datetime format
-df1["month"] = pd.to_datetime(df1.month)
+#df1["month"] = pd.to_datetime(df1.month)
 
 # tidy data and replace nulls with appropriate blanks
-df1["High_LA"] = False
-df1.loc[(df1["Is_High_LA"]=="TRUE")|(df1["Is_High_LA"].astype(str)=="True"),"High_LA"] = True
-df1["LA"] = False
-df1.loc[df1["Is_LA"].astype(str)=="True","LA"] = True
-
-
+#df1["High_LA"] = False
+#df1.loc[(df1["Is_High_LA"]=="TRUE")|(df1["Is_High_LA"].astype(str)=="True"),"High_LA"] = True
+#df1["LA"] = False
+#df1.loc[df1["Is_LA"].astype(str)=="True","LA"] = True
+  
+from pandas.api.types import is_numeric_dtype  
 for y in df1.columns:
-    if(df1[y].dtype == np.float64):
+    if is_numeric_dtype(df1[y].dtype):
           df1[y].fillna(0,inplace=True)
-    else:
-          df1[y].fillna('none',inplace=True)
+
 
 # count included practices and CCGs
 print (df1.practice.nunique()," total practices")
@@ -588,33 +640,12 @@ print (dftest.pct.nunique()," CCGs")
 # ## Practice data for regression analysis
 
 # +
-# use data filtered to latest 6 months only, and currently active practices with standard CCG codes. 
-tab = dftest.copy()
-tab = tab.drop(["status_code","Is_High_LA","quantity","net_cost","actual_cost"],axis=1)
-
-# create columns for high-dose and long-acting OME
-tab.loc[tab["High_LA"]==True,"Items High Dose"] = tab["items"]
-tab.loc[tab["Is_LA"]==True,"Items Long Acting"] = tab["items"]
-
-# sum to aggregate months and chemical substances together
-tab = tab.fillna(0).drop(["Is_LA","High_LA"],axis=1)
-tab = tab.groupby(["pct","practice"]).sum().reset_index()
-
-# get population size for each practice averaged over latest 6 months
-p2 = pop[["practice","total_list_size","month"]].loc[pop["month"]> df1["month"].max()-pd.DateOffset(months=6)]
-p2 = pd.DataFrame(p2.groupby("practice")["total_list_size"].mean()).reset_index()
-
-tab = tab.merge(p2, on=["practice"])
-tab["OME_per_1000"] = 1000*tab["total_ome"]/tab.total_list_size
-
-tab["Items % High Dose"] = (100*tab["Items High Dose"]/tab["Items Long Acting"])
-
-#tab.to_csv('opioids_practice_level_for_regression_updated.csv')
-tab.head()
-
+#
 # -
 
 # ## Practice trends analysis (monthly data, 2010-2018)
+
+df1.info()
 
 # ### (a) Create calculated fields e.g total OME per 1000 population
 
@@ -623,19 +654,19 @@ tab.head()
 df = df1.copy()
 
 # tidy data
-df = df.drop(["pct","Is_High_LA","Is_LA","quantity","net_cost"],axis=1).reset_index(drop=True)
+df = df.drop(["pct","quantity","net_cost"],axis=1).reset_index(drop=True)
 
 # create columns for high dose and long acting OME
-df.loc[df["LA"]==True,"Items Long Acting"] = df["items"]
-df.loc[df["High_LA"]==True,"Items High Dose"] = df["items"]
-df.loc[df["LA"]==True,"OME Long Acting"] = df["total_ome"]
-df.loc[df["High_LA"]==True,"OME High Dose"] = df["total_ome"]
-df.loc[df["LA"]==True,"Cost Long Acting"] = df["actual_cost"]
-df.loc[df["High_LA"]==True,"Cost High Dose"] = df["actual_cost"]
+df.loc[df["Is_LA"]==True,"Items Long Acting"] = df["items"]
+df.loc[df["Is_High_LA"]==True,"Items High Dose"] = df["items"]
+df.loc[df["Is_LA"]==True,"OME Long Acting"] = df["total_ome"]
+df.loc[df["Is_High_LA"]==True,"OME High Dose"] = df["total_ome"]
+df.loc[df["Is_LA"]==True,"Cost Long Acting"] = df["actual_cost"]
+df.loc[df["Is_High_LA"]==True,"Cost High Dose"] = df["actual_cost"]
 
-df = df.fillna(0).drop(["LA","High_LA"],axis=1)
-df = df.groupby(["month","practice"]).sum().reset_index()
 
+
+# +
 df2 = df.rename(columns={"total_ome":"Total OME",
                           "items":"Total Items",
                           "actual_cost":"Total Cost"})
@@ -674,9 +705,9 @@ import seaborn as sns
 
 sns.set_style("whitegrid",{'grid.color': '.9'})
 dfp = pc.sort_values(by=["month","measure"])
-dfp['month'] = dfp['month'].astype(str)
+#dfp['month'] = dfp['month'].astype(str)
 # set format for dates:
-dfp['dates'] = [datetime.datetime.strptime(date, '%Y-%m-%d').date() for date in dfp['month']]
+#dfp['dates'] = [datetime.datetime.strptime(date, '%Y-%m-%d').date() for date in dfp['month']]
 
 
 # set sort order of measures manually, and add grid refs to position each subplot:
@@ -698,16 +729,16 @@ for i in s:
     for decile in range(1,10):   # plot each decile line
         data = dfp.loc[(dfp['measure']==i[1]) & (dfp['index']==decile)]
         if decile == 5:
-            ax.plot(data["dates"],data['value'],'b-',linewidth=0.7)
+            ax.plot(data["month"],data['value'],'b-',linewidth=0.7)
         else:
-            ax.plot(data["dates"],data['value'],'b--',linewidth=0.4)
+            ax.plot(data["month"],data['value'],'b--',linewidth=0.4)
     ax.set_ylabel(i[4], size =14, alpha=0.6)
     ax.set_title(i[5],size = 17)
     ax.set_ylim([0,1.05*data["value"].max()])
     if  i[4]=="Percent":    # set y axis limit only for percentage measure
         ax.set_ylim([0, 70])
     ax.tick_params(labelsize=12)
-    ax.set_xlim([dfp['dates'].min(), dfp['dates'].max()]) # set x axis range as full date range
+    ax.set_xlim([dfp['month'].min(), dfp['month'].max()]) # set x axis range as full date range
 
 plt.subplots_adjust(wspace = 0.13,hspace = 0.16)
 
@@ -724,28 +755,28 @@ plt.show()
 # +
 # filter to latest 6 months only
 df4 = dftest
-df4 = df4.drop(["Is_High_LA","quantity","net_cost"],axis=1)
+df4 = df4.drop(["quantity","net_cost"],axis=1)
 
 # group to ccg level and combine the 6 months
-df4 = pd.DataFrame(df4.groupby(["pct","chem_substance","Is_LA","High_LA"])["items","total_ome","actual_cost"].sum()).reset_index()
+df4 = pd.DataFrame(df4.groupby(["pct","chem_substance","Is_LA","Is_High_LA"])["items","total_ome","actual_cost"].sum()).reset_index()
 
-df4["fent_ome"] = np.where((df4["chem_substance"] == "Fentanyl")& (df4["High_LA"]==True),df4["total_ome"],0)
-df4["morph_ome"] = np.where((df4["chem_substance"] == "Morphine Sulfate")& (df4["High_LA"]==True),df4["total_ome"],0)
-df4["oxyco_ome"] = np.where((df4["chem_substance"] == "Oxycodone Hydrochloride")& (df4["High_LA"]==True),df4["total_ome"],0)
+df4["fent_ome"] = np.where((df4["chem_substance"] == "Fentanyl")& (df4["Is_High_LA"]==True),df4["total_ome"],0)
+df4["morph_ome"] = np.where((df4["chem_substance"] == "Morphine Sulfate")& (df4["Is_High_LA"]==True),df4["total_ome"],0)
+df4["oxyco_ome"] = np.where((df4["chem_substance"] == "Oxycodone Hydrochloride")& (df4["Is_High_LA"]==True),df4["total_ome"],0)
 df4["practice_count"] = 1
 
 # aggregate chem substances
-df = pd.DataFrame(df4.groupby(["pct","Is_LA","High_LA"]).sum()).reset_index()
+df = pd.DataFrame(df4.groupby(["pct","Is_LA","Is_High_LA"]).sum()).reset_index()
 
 # create columns for high dose and long acting OME
 df.loc[df["Is_LA"]==True,"Items Long Acting"] = df["items"]
-df.loc[df["High_LA"]==True,"Items High Dose"] = df["items"]
+df.loc[df["Is_High_LA"]==True,"Items High Dose"] = df["items"]
 df.loc[df["Is_LA"]==True,"OME Long Acting"] = df["total_ome"]
-df.loc[df["High_LA"]==True,"OME High Dose"] = df["total_ome"]
+df.loc[df["Is_High_LA"]==True,"OME High Dose"] = df["total_ome"]
 df.loc[df["Is_LA"]==True,"Cost Long Acting"] = df["actual_cost"]
-df.loc[df["High_LA"]==True,"Cost High Dose"] = df["actual_cost"]
+df.loc[df["Is_High_LA"]==True,"Cost High Dose"] = df["actual_cost"]
 
-df = df.fillna(0).drop(["Is_LA","High_LA"],axis=1)
+df = df.drop(["Is_LA","Is_High_LA"],axis=1)
 df = df.groupby(["pct"]).sum().reset_index()
 
 df3 = df.rename(columns={"total_ome":"Total OME",
@@ -801,7 +832,7 @@ FROM  `hscic.ccgs` c
 WHERE org_type = "CCG"
 '''
 
-names = pd.io.gbq.read_gbq(qc, GBQ_PROJECT_ID, dialect='standard',verbose=True)
+names = bq.cached_read(qc, csv_path='ccg_names.csv')
 spending2 = spending.merge(names[['code','name']],left_on="pct",right_on="code")
 spending2 = spending2.drop(["code","fent_ome","morph_ome","oxyco_ome"],axis=1).set_index('name')
 spending2 = spending2.round(0)
@@ -1009,7 +1040,17 @@ yr1["year"] = yr1['month'].dt.year
 yr1.head()
 # -
 
-yr2 = yr1[["pct","practice","month","year","total_ome"]].groupby(["pct","practice","month","year"]).sum()
+df1.info()
+
+yr1 = df1.loc[(df1["pct"].str.match(r"([0-9]{2})([A-Za-z])"))& (df1['month'].dt.year>=2016)].reset_index()
+yr1["year"] = yr1['month'].dt.year
+yr1.head()
+
+# + {"active": ""}
+#
+# -
+
+yr2 = yr1[["pct","practice","month","year","total_ome"]].groupby(["pct","practice","month","year"])['total_ome'].sum()
 yr2 = yr2.reset_index().merge(pop[["practice","month","total_list_size"]], on=["practice","month"]).groupby(["pct","month","year"]).sum()
 yr2.head()
 
@@ -1116,7 +1157,7 @@ FROM ebmdatalab.hscic.normalised_prescribing_standard p
 WHERE SUBSTR(p.bnf_code,1,6) IN ("040201","040702","100101")'''
 
 
-ccg = pd.io.gbq.read_gbq(q5, GBQ_PROJECT_ID, dialect='standard',verbose=True)
+ccg = bq.cached_read(q5, 'opiods_by_practice_setting.csv.gz', use_bqstorage_api=True)
 ccg.head()
 # -
 
@@ -1153,8 +1194,7 @@ order by chem_substance, dose_per_unit desc
     '''
 
 
-tbl = pd.io.gbq.read_gbq(q, GBQ_PROJECT_ID, dialect='standard',verbose=True)
-#tbl.to_csv("opioids_high_dose_formulations.csv")
+tbl = bq.cached_read(q, csv_path='opioids_high_dose_formulations.csv')
 tbl.head()
 # -
 
